@@ -2,7 +2,12 @@ import { gzipSync } from 'node:zlib';
 
 import { describe, expect, it } from 'vitest';
 
-import { CHART_SERIES_VERSION, computeChartSeries } from './compute-chart-series.js';
+import {
+  CHART_SERIES_VERSION,
+  computeChartDataFromMetricPhases,
+  computeChartSeries,
+  type MetricsMap,
+} from './compute-chart-series.js';
 
 function makeBlob(opts?: {
   prefixHits?: number;
@@ -740,17 +745,19 @@ describe('computeChartSeries', () => {
     expect(result?.hostKvCacheUsage).toEqual([{ t: 0, value: 0.25 }]);
     expect(result?.prefixCacheHitRate).toEqual([{ t: 0, value: 0.4 }]);
     expect(result?.queueDepth).toEqual([{ t: 0, running: 5, waiting: 4, total: 9 }]);
-    expect(result?.prefillTps).toEqual([{ t: 0, value: 300 }]);
+    // Decode re-reports prompts it received by transfer, so prompt counters come from prefill.
+    expect(result?.prefillTps).toEqual([{ t: 0, value: 100 }]);
     expect(result?.decodeTps).toEqual([{ t: 0, value: 50 }]);
     expect(result?.promptTokensBySource).toEqual({
-      'cache hit (HBM)': [{ t: 0, value: 120 }],
-      'compute (miss)': [{ t: 0, value: 180 }],
+      'cache hit (HBM)': [{ t: 0, value: 40 }],
+      'compute (miss)': [{ t: 0, value: 60 }],
     });
     expect(result?.metricSources.map(({ source }) => [source.role, source.endpointUrl])).toEqual([
       ['prefill', prefillUrl],
       ['decode', decodeUrl],
     ]);
     expect(result?.metricSources[0]?.promptTps).toEqual([{ t: 0, value: 100 }]);
+    expect(result?.metricSources[1]?.promptTps).toEqual([{ t: 0, value: 200 }]);
     expect(result?.metricSources[1]?.generationTps).toEqual([{ t: 0, value: 50 }]);
   });
 
@@ -1086,5 +1093,95 @@ describe('computeChartSeries summed series', () => {
       { t: 1, value: 20 },
       { t: 2, value: 30 },
     ]);
+  });
+});
+
+describe('TRT-LLM disaggregated prompt-token totals', () => {
+  const prefillUrl = 'http://prefill:7500/metrics';
+  const decodeUrls = ['http://decode-a:7501/metrics', 'http://decode-b:7502/metrics'];
+
+  const counter = (
+    endpoint_url: string,
+    dynamo_component: 'prefill' | 'backend',
+    slices: [startS: number, total: number][],
+  ) => ({
+    endpoint_url,
+    labels: { dynamo_component, worker_id: endpoint_url },
+    timeslices: slices.map(([startS, total]) => ({
+      start_ns: startS * 1e9,
+      end_ns: (startS + 1) * 1e9,
+      total,
+      rate: total,
+    })),
+  });
+
+  // One prefill server computes 3% of 1000 prompt tokens; each decode server re-reports
+  // the 500 prompt tokens it received by transfer, with `decodeCached` of them as cached.
+  const disaggMetrics = (decodeCached: number): MetricsMap => ({
+    trtllm_prompt_tokens: {
+      series: [
+        counter(prefillUrl, 'prefill', [[0, 1000]]),
+        ...decodeUrls.map((url) => counter(url, 'backend', [[0, 500]])),
+      ],
+    },
+    trtllm_prompt_cached_tokens: {
+      series: [
+        counter(prefillUrl, 'prefill', [[0, 970]]),
+        ...decodeUrls.map((url) => counter(url, 'backend', [[0, decodeCached]])),
+      ],
+    },
+  });
+
+  it.each([
+    ['counts transferred KV as cached', 500],
+    ['reports no cached tokens', 0],
+  ])('reads the hit rate from prefill when decode %s', (_, decodeCached) => {
+    const { promptTokenTotals, series } = computeChartDataFromMetricPhases(
+      disaggMetrics(decodeCached),
+      {},
+      { framework: 'dynamo-trt', disagg: true },
+    );
+    expect(promptTokenTotals.prompt).toBe(1000);
+    expect(promptTokenTotals.prefixCacheHits).toBe(970);
+    expect(series.prefixCacheHitRate).toEqual([{ t: 0, value: 0.97 }]);
+    const decodeSource = series.metricSources.find(({ source }) => source.role === 'decode');
+    expect(decodeSource?.promptTps).toEqual([{ t: 0, value: 500 }]);
+  });
+
+  it('still sums every endpoint of an aggregated deployment', () => {
+    const { promptTokenTotals } = computeChartDataFromMetricPhases(
+      disaggMetrics(500),
+      {},
+      { framework: 'dynamo-trt', disagg: false },
+    );
+    expect(promptTokenTotals.prompt).toBe(2000);
+    expect(promptTokenTotals.prefixCacheHits).toBe(1970);
+  });
+
+  it('counts warmup once when a counter first appears during warmup', () => {
+    // trtllm_prompt_cached_tokens appears at the first warmup hit, so AIPerf's profiling
+    // series starts with the warmup slices again; trtllm_prompt_tokens starts at profiling.
+    const profiling: MetricsMap = {
+      trtllm_prompt_tokens: {
+        series: [counter(prefillUrl, 'prefill', [[10, 1000]])],
+      },
+      trtllm_prompt_cached_tokens: {
+        series: [
+          counter(prefillUrl, 'prefill', [
+            [0, 50],
+            [10, 970],
+          ]),
+        ],
+      },
+    };
+    const warmup: MetricsMap = {
+      trtllm_prompt_tokens: { series: [counter(prefillUrl, 'prefill', [[0, 100]])] },
+      trtllm_prompt_cached_tokens: { series: [counter(prefillUrl, 'prefill', [[0, 50]])] },
+    };
+    const { promptTokenTotals } = computeChartDataFromMetricPhases(profiling, warmup, {
+      framework: 'trtllm',
+    });
+    expect(promptTokenTotals.prompt).toBe(1100);
+    expect(promptTokenTotals.prefixCacheHits).toBe(1020);
   });
 });

@@ -5,7 +5,7 @@ import {
   type ServerMetricsContext,
 } from './server-metrics-adapters';
 
-export const CHART_SERIES_VERSION = 20;
+export const CHART_SERIES_VERSION = 21;
 
 export interface TimeSeriesPoint {
   t: number;
@@ -127,11 +127,66 @@ function mergePhaseMetrics(profiling: MetricsMap, warmup: MetricsMap): MetricsMa
   if (Object.keys(profiling).length === 0) return warmup;
   const out: MetricsMap = {};
   for (const name of new Set([...Object.keys(profiling), ...Object.keys(warmup)])) {
+    const profilingSeries = profiling[name]?.series ?? [];
     out[name] = {
-      series: [...(profiling[name]?.series ?? []), ...(warmup[name]?.series ?? [])],
+      series: [
+        ...profilingSeries,
+        ...(warmup[name]?.series ?? []).map((s) => warmupNotInProfiling(s, profilingSeries)),
+      ],
     };
   }
   return out;
+}
+
+function sameScrapedSeries(a: RawSeries, b: RawSeries): boolean {
+  if (a.endpoint_url !== b.endpoint_url) return false;
+  const aLabels = a.labels ?? {};
+  const bLabels = b.labels ?? {};
+  const names = Object.keys(aLabels);
+  return (
+    names.length === Object.keys(bLabels).length &&
+    names.every((name) => aLabels[name] === bLabels[name])
+  );
+}
+
+/**
+ * Some exporters' profiling series repeat the whole warmup window on their own
+ * scrape offsets (Dynamo TRT-LLM counters such as prompt_cached_tokens carry
+ * every warmup slice again), so the union would count warmup twice. A warmup
+ * slice whose midpoint lies inside a profiling slice of the same series is
+ * dropped; the profiling block's lone boundary samples cover at most one each.
+ */
+function warmupNotInProfiling(warmup: RawSeries, profiling: readonly RawSeries[]): RawSeries {
+  if (!warmup.timeslices) return warmup;
+  const intervals: [number, number][] = [];
+  for (const s of profiling) {
+    if (!sameScrapedSeries(s, warmup)) continue;
+    for (const slice of s.timeslices ?? []) {
+      if (typeof slice.start_ns === 'number' && typeof slice.end_ns === 'number') {
+        intervals.push([slice.start_ns, slice.end_ns]);
+      }
+    }
+  }
+  if (intervals.length === 0) return warmup;
+  intervals.sort((a, b) => a[0] - b[0]);
+  const covered = (ns: number): boolean => {
+    let lo = 0;
+    let hi = intervals.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (intervals[mid]![0] <= ns) lo = mid + 1;
+      else hi = mid;
+    }
+    // Slices of one series do not overlap, so only the last one starting by ns can hold it.
+    return lo > 0 && ns < intervals[lo - 1]![1];
+  };
+  const timeslices = warmup.timeslices.filter(
+    (slice) =>
+      typeof slice.start_ns !== 'number' ||
+      typeof slice.end_ns !== 'number' ||
+      !covered((slice.start_ns + slice.end_ns) / 2),
+  );
+  return timeslices.length === warmup.timeslices.length ? warmup : { ...warmup, timeslices };
 }
 
 /**
@@ -613,13 +668,58 @@ function scopeAtomPdToPrefill(metrics: MetricsMap): { metrics: MetricsMap; pd: b
   return { metrics: scoped, pd: true };
 }
 
+const TRTLLM_PROMPT_METRICS = [
+  'trtllm_prompt_tokens',
+  'trtllm_prompt_tokens_total',
+  'trtllm_prompt_cached_tokens',
+  'trtllm_prompt_cached_tokens_total',
+  'trtllm_prefill_batch_tokens',
+  'trtllm_kv_cache_hit_rate',
+];
+
+/**
+ * A disaggregated TRT-LLM decode worker re-reports every prompt it receives
+ * and counts the KV transferred from prefill as cached (or, on some builds, as
+ * not cached at all), so the prompt and cache counters would count each prompt
+ * twice. They are read from every endpoint except those labelled decode.
+ */
+function scopeTrtllmDisaggToPrefill(
+  metrics: MetricsMap,
+  context: ServerMetricsContext,
+): MetricsMap {
+  const adapter = selectServerMetricsAdapter(context);
+  if (!context.disagg || adapter.id !== 'trtllm') return metrics;
+  const decode = new Set<string>();
+  for (const metric of Object.values(metrics)) {
+    for (const s of metric.series ?? []) {
+      if (s.endpoint_url && adapter.identifySource(s).role === 'decode') {
+        decode.add(s.endpoint_url);
+      }
+    }
+  }
+  if (decode.size === 0) return metrics;
+  const scoped = { ...metrics };
+  let kept = 0;
+  for (const name of TRTLLM_PROMPT_METRICS) {
+    const series = metrics[name]?.series;
+    if (series) {
+      const prefillSeries = series.filter((s) => !s.endpoint_url || !decode.has(s.endpoint_url));
+      kept += prefillSeries.length;
+      scoped[name] = { series: prefillSeries };
+    }
+  }
+  // A decode worker's own source breakdown keeps its counters.
+  return kept > 0 ? scoped : metrics;
+}
+
 function buildChartData(
   rawMetrics: MetricsMap,
   context: ServerMetricsContext,
   includeMetricSources = true,
   originStartNs?: number,
 ): ChartData {
-  const { metrics, pd: atomPd } = scopeAtomPdToPrefill(rawMetrics);
+  const { metrics: sourceMetrics, pd: atomPd } = scopeAtomPdToPrefill(rawMetrics);
+  const metrics = scopeTrtllmDisaggToPrefill(sourceMetrics, context);
   let startNs = Number.POSITIVE_INFINITY;
   let endNs = 0;
   let timeslicesCount = 0;
@@ -889,7 +989,7 @@ function buildChartData(
   const adapter = selectServerMetricsAdapter(context);
   if (includeMetricSources && context.disagg && adapter.id !== 'generic') {
     const endpointRoles = new Map<string, string>();
-    for (const metric of Object.values(metrics)) {
+    for (const metric of Object.values(sourceMetrics)) {
       for (const series of metric.series ?? []) {
         const endpointUrl = series.endpoint_url;
         const role = series.labels?.['disaggregation_mode'] ?? series.labels?.['dynamo_component'];
@@ -897,7 +997,7 @@ function buildChartData(
       }
     }
     const grouped = new Map<string, { source: MetricSource; metrics: MetricsMap }>();
-    for (const [metricName, metric] of Object.entries(metrics)) {
+    for (const [metricName, metric] of Object.entries(sourceMetrics)) {
       for (const series of metric.series ?? []) {
         const roleHint = series.endpoint_url ? endpointRoles.get(series.endpoint_url) : undefined;
         const identifiedSeries =

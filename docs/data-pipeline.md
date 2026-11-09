@@ -402,13 +402,33 @@ in the `DATABASE_WRITE_URL` database, then invalidates the app cache. It does no
 
 A raw series in the blob is one `(scrape endpoint × phase block × label set)` tuple, which is **not** the same as one engine. The KV-cache chart needs one entry per _logical engine_ — one KV pool — so `compute-chart-series.ts` groups series by their Prometheus label set (`seriesIdentityKey`) rather than emitting one entry per raw series. Three kinds of duplication collapse there:
 
-- **Phase blocks.** The warmup and profiling blocks each carry their own series for the same engine, so keying by scrape instant unions them into one continuous line. The two blocks' first/last bounds can look overlapping — the profiling series often emits a single boundary sample and then gaps until warmup ends — but they never share a scrape instant, so the union neither drops nor double-counts a sample.
+- **Phase blocks.** The warmup and profiling blocks each carry their own series for the same engine, so keying by scrape instant unions them into one continuous line. The two blocks' first/last bounds can look overlapping — the profiling series often emits a single boundary sample and then gaps until warmup ends — but they never share a scrape instant. Some exporters' profiling series instead repeat the whole warmup window on their own scrape offsets (Dynamo TRT-LLM counters such as `trtllm_prompt_cached_tokens` carry every warmup slice again), which the union would count twice. `mergePhaseMetrics` therefore drops a warmup slice whose midpoint lies inside a profiling slice of the same series; a lone boundary sample covers at most one warmup slice.
 - **Mirrored API-server frontends.** vLLM run with several API servers exposes the _same_ engine set on every `/metrics` endpoint, a few hundred ms apart. Identity ignores `endpoint_url` (Prometheus treats the label set as the series), and the endpoint covering the most wall-clock wins — merging the mirrors instead would interleave near-duplicate samples and halve the effective span of the frontend's fixed-width rolling average. Endpoints are only fused when their values actually agree; same-label endpoints whose readings diverge are independent replicas behind a router, and are kept as separate engines so none is silently discarded.
 - **Intra-engine shard ranks.** `tp_rank` / `pp_rank` / `ep_rank` / `moe_ep_rank` shard one pool and all report the same utilization, so they are excluded from the identity and averaged. `engine` / `engine_idx` / `dp_rank` are _not_ excluded — those do name distinct pools.
 
 The cluster average is then a mean across those logical engines on the union of their scrape instants, with each engine holding its last sample until its next one and contributing only inside its own observed window (and only while that sample is fresher than 5× the engine's own median scrape gap, so a reporting hole drops the engine out of the mean rather than pinning it to a stale reading). Grouping on an exact `start_ns` instead would average whichever engines happened to share that nanosecond — on a disaggregated run that alternates between "prefill only" and "decode only" and reads as a full-scale sawtooth.
 
 Engines are ordered by role, then numeric rank, then worker — never by the composed display string, which would sort `"decode 10"` before `"decode 2"` and scramble DP ranks. The role is only shown when engines actually differ in role, so an aggregated deployment reads `DP 0…DP 3` rather than `decode 0…decode 3`.
+
+### TensorRT-LLM Disaggregated Prompt Counters
+
+A disaggregated TRT-LLM decode worker re-reports every prompt it receives from
+prefill in `trtllm_prompt_tokens`. What it reports as cached depends on the
+build. Before TensorRT-LLM #19743 (in 1.4.0rc0 and later), every decode step
+wrote its position into the request's write-once cached-token count, so a
+decode worker reported each prompt as fully cached (GLM-5.2 GB300 on
+1.3.0rc28). Since that fix it reports only the prefix it matched in its own
+cache: 0 with block reuse off (GLM-5.2 on 1.4.0rc2, Qwen3.5), or
+the real reuse of a decode worker that keeps conversation KV (MiniMax).
+Summing every endpoint therefore counts each prompt twice and pushes the row
+hit rate towards `(h + 1) / 2` or `h / 2`. For disaggregated TRT-LLM runs,
+`scopeTrtllmDisaggToPrefill` reads the prompt, cached-prompt, prefill-batch and
+hit-rate metrics from every endpoint except those labelled decode
+(`disaggregation_mode=decode` or Dynamo's `dynamo_component=backend`). This
+covers the aggregate series, the ingested `server_gpu_cache_hit_rate`, and the
+prompt-token breakdown. Per-worker metric sources keep each decode worker's own
+counters. `db:backfill-chart-series` refreshes the row cache rates of these runs
+together with their chart series.
 
 ### ATOM Server Metrics
 

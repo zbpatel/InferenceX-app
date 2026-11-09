@@ -2091,7 +2091,10 @@ export const apiContractSourceDigests = [
   },
   {
     source: '../db/src/etl/compute-chart-series.ts',
-    sourceSha256: '58aac3b66d93368fb19aad574636af843ed0d8150dff3b4a4c08804aaddf4095',
+    // Reviewed for version 21: disaggregated TRT-LLM prompt series read prefill
+    // endpoints only and warmup slices repeated by profiling are dropped. The
+    // response fields and their semantics are unchanged, so the docs stand.
+    sourceSha256: 'ded4b8ec5f2a0b92a2f0c9e1f8926fd1b79777ecd94ee6f4d5463ac8949e8eda',
     reviewArea: {
       en: 'Server metric chart version, supported engine metrics, source identity, and missing-data semantics.',
       zh: '服务器指标图表版本、支持的引擎指标、来源标识以及缺失数据语义。',
